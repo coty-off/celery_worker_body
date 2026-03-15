@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="Python 3.13 (celery_worker_body)" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="Python 3.13 (coty_body_api)" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="Python 3.13 (celery_worker_body)" project-jdk-type="Python SDK" />
 </project>
