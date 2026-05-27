@@ -6,6 +6,9 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from redis import Redis
+
+import httpx
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, status
@@ -35,7 +38,7 @@ INTERNAL_API_KEY: str = os.getenv("INTERNAL_API_KEY", "")
 TMP_DIR = Path(os.getenv("TMP_DIR", "/tmp/photos"))
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-MAX_IMAGE_BYTES: int = 10 * 1024 * 1024
+MAX_IMAGE_BYTES: int = 24 * 1920 * 1080
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
 
 
@@ -101,9 +104,11 @@ celery_client = Celery(
     backend=REDIS_BACKEND,
 )
 
+redis_client = Redis.from_url(REDIS_BROKER, decode_responses=True)
+
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 
 def hash_password(password: str) -> str:
@@ -214,6 +219,9 @@ class TaskStatusResponse(BaseModel):
     status: str
     result: Optional[Dict[str, Any]] = None
 
+class YandexAuthRequest(BaseModel):
+    yandex_token: str
+
 
 def _validate_image(file: UploadFile, content: bytes) -> None:
     if len(content) > MAX_IMAGE_BYTES:
@@ -232,8 +240,38 @@ app = FastAPI(
     title="coty_body API",
     version="2.0.0",
     description="API для определения типа фигуры женщины по фото анфас и профиль.",
+    root_path="/api"
 )
 
+@app.post("/auth/yandex", response_model=TokenResponse, tags=["auth"])
+async def yandex_login(body: YandexAuthRequest, db: Session = Depends(get_db)) -> TokenResponse:
+    # Верифицируем токен через Яндекс
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://login.yandex.ru/info",
+            headers={"Authorization": f"OAuth {body.yandex_token}"},
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=401, detail="Невалидный токен Яндекса")
+
+    yandex_data = resp.json()
+    email = yandex_data.get("default_email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Яндекс не вернул email")
+
+    # Ищем юзера или создаём нового
+    user = db.query(UserModel).filter(UserModel.email == email).first()
+    if not user:
+        user = UserModel(
+            email=email,
+            hashed_password=hash_password(os.urandom(32).hex()),  # случайный пароль — вход только через Яндекс
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    return TokenResponse(access_token=create_access_token(user.id))
 
 @app.post("/auth/register", response_model=TokenResponse, status_code=201, tags=["auth"])
 def register(body: RegisterRequest, db: Session = Depends(get_db)) -> TokenResponse:
@@ -264,9 +302,9 @@ def get_me(current_user: UserModel = Depends(get_current_user)) -> UserOut:
 
 @app.post("/analyze", response_model=AnalyzeResponse, tags=["analyze"])
 async def analyze(
-    front_image: UploadFile = File(..., description="Фото анфас"),
-    side_image: UploadFile = File(..., description="Фото профиль"),
-    height_cm: float = Form(..., description="Рост в сантиметрах"),
+    front_image: UploadFile = File(...),
+    side_image: UploadFile = File(...),
+    height_cm: float = Form(...),
     current_user: UserModel = Depends(get_current_user),
 ) -> AnalyzeResponse:
     front_bytes = await front_image.read()
@@ -282,6 +320,10 @@ async def analyze(
         "analyze_photo",
         args=[str(front_path), str(side_path), height_cm, current_user.id],
     )
+
+    # Привязываем task_id к владельцу, храним 1 час (как result_expires)
+    redis_client.setex(f"task_owner:{task.id}", 3600, current_user.id)
+
     return AnalyzeResponse(task_id=task.id)
 
 
@@ -290,6 +332,10 @@ def get_task_status(
     task_id: str,
     current_user: UserModel = Depends(get_current_user),
 ) -> TaskStatusResponse:
+    owner_id = redis_client.get(f"task_owner:{task_id}")
+    if not owner_id or owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Нет доступа к этой задаче")
+
     async_result = celery_client.AsyncResult(task_id)
     return TaskStatusResponse(
         task_id=task_id,
